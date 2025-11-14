@@ -1,0 +1,184 @@
+# Layer Partitioning Configuration for Split CPU/iGPU Inference
+# Target: Intel Core Ultra 9 185H (16 cores, 22 threads, Arc iGPU)
+
+# Global settings
+global:
+  model_name: "Phi-tiny-MoE"
+  num_layers: 32
+  num_experts: 16
+  experts_per_token: 2
+  
+  # Memory limits (MB)
+  cpu_memory_limit: 8192  # 8GB for model weights
+  igpu_memory_limit: 4096  # 4GB for iGPU local memory
+  
+  # Bandwidth budget (GB/s)
+  max_cpu_bandwidth: 50.0  # Realistic for LPDDR5
+  max_igpu_bandwidth: 40.0  # Shared memory bus
+  
+  # Scheduling policy
+  scheduling_policy: "bandwidth_aware"  # Options: static, bandwidth_aware, adaptive
+  enable_pipelining: true
+  enable_double_buffering: true
+  micro_batch_size: 4  # Tokens per micro-batch
+
+# Static partitioning: which operations go to which device
+# Format: operation_type: device (cpu/igpu/auto)
+static_partition:
+  # Input processing (CPU - minimal cost, high branching)
+  embedding: cpu
+  position_encoding: cpu
+  
+  # Per-layer operations
+  layer_operations:
+    # Attention components
+    attention_qkv_proj: igpu      # Heavy GEMM - better on iGPU if batched
+    attention_compute: auto       # Depends on sequence length and batch
+    attention_output_proj: igpu
+    attention_layernorm: cpu      # Lightweight, high memory bandwidth
+    
+    # MoE routing (critical path)
+    router_logits: cpu            # Small GEMM, low latency needed
+    expert_selection: cpu         # Top-k on CPU (< 1ms for 16 experts)
+    expert_masking: cpu           # One-hot encoding - cheap
+    
+    # Expert computation (heavy lifting)
+    expert_dispatch: igpu         # Scatter tokens to experts
+    expert_ffn_w1: igpu          # Up-projection GEMM
+    expert_ffn_activation: igpu   # SiLU activation
+    expert_ffn_w2: igpu          # Down-projection GEMM
+    expert_gather: igpu          # Gather + weighted sum
+    
+    # Post-MoE
+    moe_layernorm: cpu
+  
+  # Output processing
+  lm_head: cpu                    # Final projection - keep on CPU for low latency
+
+# Dynamic thresholds for auto-partitioning
+dynamic_thresholds:
+  # Switch attention to CPU if:
+  attention_to_cpu:
+    sequence_length_max: 512      # For long sequences, avoid iGPU memory
+    batch_size_min: 4             # Need batching to saturate iGPU
+  
+  # Switch expert computation to CPU if:
+  expert_to_cpu:
+    tokens_per_expert_min: 2      # Need at least 2 tokens for GEMM efficiency
+    igpu_memory_pressure: 0.8     # If iGPU > 80% memory, fallback to CPU
+    cpu_idle: 0.5                 # If CPU < 50% utilized, rebalance
+
+# Bandwidth-aware scheduling
+bandwidth_control:
+  # Token semaphore: only one device can do heavy DRAM access at a time
+  enable_token_semaphore: true
+  
+  # Define "heavy DRAM" operations (will acquire semaphore)
+  heavy_operations:
+    - expert_weight_load
+    - attention_kv_cache_load
+    - embedding_lookup
+  
+  # Bandwidth monitoring
+  monitoring_interval_ms: 10      # Sample bandwidth every 10ms
+  bandwidth_window_size: 50       # Moving average over 50 samples
+  
+  # Throttling policy
+  throttle_threshold: 0.85        # Throttle if bandwidth > 85% of max
+  throttle_action: "reduce_batch" # Options: reduce_batch, delay_launch, fallback_cpu
+
+# Pipelining configuration
+pipelining:
+  # Pipeline stages
+  stages:
+    - name: "cpu_router"
+      device: cpu
+      operations: [router_logits, expert_selection]
+    
+    - name: "igpu_expert_0_7"
+      device: igpu
+      operations: [expert_ffn]
+      expert_range: [0, 7]
+    
+    - name: "igpu_expert_8_15"
+      device: igpu
+      operations: [expert_ffn]
+      expert_range: [8, 15]
+    
+    - name: "cpu_attention"
+      device: cpu
+      operations: [attention_layernorm, attention_compute]
+  
+  # Double buffering for expert weights
+  expert_staging:
+    buffer_count: 2               # Double buffer
+    experts_per_buffer: 2         # Stage 2 experts at a time (top-k=2)
+    prefetch_strategy: "predict"  # Options: sequential, predict, random
+
+# Memory management
+memory:
+  # USM (Unified Shared Memory) configuration
+  use_usm: true
+  usm_mode: "host"                # Options: host, device, shared
+  
+  # Explicit DMA staging
+  staging_buffer_size_mb: 512     # 512MB staging buffer on iGPU
+  
+  # Expert weight caching
+  expert_cache:
+    enabled: true
+    cache_size_mb: 1024           # Cache up to 1GB of expert weights
+    eviction_policy: "lru"        # Least Recently Used
+    
+# Telemetry and profiling
+telemetry:
+  enabled: true
+  output_format: "json"           # Options: json, csv, console
+  output_path: "./telemetry"
+  
+  # Metrics to collect
+  metrics:
+    - kernel_duration
+    - queue_depth
+    - memory_bandwidth
+    - memory_usage
+    - expert_selection_distribution
+    - cpu_igpu_contention
+    - pipeline_bubbles
+  
+  # Profiling
+  enable_vtune: false             # Requires VTune installation
+  enable_level_zero_profiling: true
+
+# Fallback and error handling
+fallback:
+  # Fallback to CPU if iGPU fails
+  enable_cpu_fallback: true
+  fallback_triggers:
+    - igpu_allocation_failure
+    - igpu_kernel_timeout
+    - igpu_error
+  
+  # Graceful degradation
+  degradation_steps:
+    - reduce_micro_batch_size
+    - disable_pipelining
+    - fallback_experts_to_cpu
+    - full_cpu_mode
+
+# Layer-specific overrides (optional)
+layer_overrides:
+  # First few layers: keep on CPU (cheap, sequential)
+  layer_0_3:
+    attention_qkv_proj: cpu
+    expert_ffn: cpu
+  
+  # Middle layers: full iGPU (hot path)
+  layer_4_27:
+    attention_qkv_proj: igpu
+    expert_ffn: igpu
+  
+  # Last few layers: back to CPU (low latency to output)
+  layer_28_31:
+    attention_qkv_proj: cpu
+    expert_ffn: cpu

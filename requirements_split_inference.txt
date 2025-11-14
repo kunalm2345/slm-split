@@ -1,0 +1,30 @@
+# Python requirements for split CPU/iGPU inference system
+
+# Core ML/inference
+torch>=2.0.0
+transformers>=4.40.0
+einops>=0.7.0
+
+# Data processing
+numpy>=1.24.0
+
+# IPC and networking
+pyzmq>=25.0.0
+
+# Configuration
+PyYAML>=6.0
+
+# ONNX export and analysis
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# System monitoring
+psutil>=5.9.0
+
+# Optional: for better performance profiling
+# py-cpuinfo>=9.0.0
+# pynvml>=11.5.0  # For NVIDIA GPU monitoring (if available)
+
+# Development dependencies (optional)
+pytest>=7.4.0
+pytest-cov>=4.1.0

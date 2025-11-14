@@ -8,28 +8,133 @@ context_length:
 library_name: transformers
 ---
 
-## Model Summary
+# Phi-tiny-MoE: Split CPU/iGPU Inference Implementation
 
-Phi-tiny-MoE is a lightweight Mixture of Experts (MoE) model with 3.8B total parameters and 1.1B activated parameters. It is compressed and distilled from the base model shared by [Phi-3.5-MoE](https://huggingface.co/microsoft/Phi-3.5-MoE-instruct) and [GRIN-MoE](https://huggingface.co/microsoft/GRIN-MoE) using the [SlimMoE](https://arxiv.org/pdf/2506.18349) approach, then post-trained via supervised fine-tuning and direct preference optimization for instruction following and safety. The model is trained on Phi-3 synthetic data and filtered public documents, with a focus on high-quality, reasoning-dense content. It is part of the SlimMoE series, which includes a larger variant, [Phi-mini-MoE](https://huggingface.co/microsoft/Phi-mini-MoE-instruct), with 7.6B total and 2.4B activated parameters.
+## 🚀 Project Overview
 
-References: <br>
-📖 [SlimMoE Paper](https://arxiv.org/pdf/2506.18349) <br>
-📖 [Phi-3 Technical Report](https://arxiv.org/abs/2404.14219) <br>
-📖 [GRIN-MoE](https://arxiv.org/abs/2409.12136) <br>
+This repository contains a **complete split CPU ↔ iGPU inference implementation** for Phi-tiny-MoE, optimized for Intel Core Ultra 9 185H (CPU + Arc iGPU) devices. The system implements bandwidth-aware scheduling to maximize performance on memory-constrained mobile/laptop hardware.
 
-## Intended Uses
+### Original Model
 
-### Primary Use Cases
+Phi-tiny-MoE is a lightweight Mixture of Experts (MoE) model with **3.8B total parameters** and **1.1B activated parameters**. It is compressed and distilled from the base model shared by [Phi-3.5-MoE](https://huggingface.co/microsoft/Phi-3.5-MoE-instruct) and [GRIN-MoE](https://huggingface.co/microsoft/GRIN-MoE) using the [SlimMoE](https://arxiv.org/pdf/2506.18349) approach.
 
-The model is intended for commercial and research use in English. The model provides uses for general purpose AI systems and applications which require memory/compute constrained environments and latency bound scenarios.
+**References**: 📖 [SlimMoE Paper](https://arxiv.org/pdf/2506.18349) | 📖 [Phi-3 Technical Report](https://arxiv.org/abs/2404.14219) | 📖 [GRIN-MoE](https://arxiv.org/abs/2409.12136)
 
-### Use Case Considerations
+---
 
-Our models are not specifically designed or evaluated for all downstream purposes. Developers should consider common limitations of language models as they select use cases, and evaluate and mitigate for accuracy, safety, and fariness before using within a specific downstream use case, particularly for high risk scenarios. Developers should be aware of and adhere to applicable laws or regulations (including privacy, trade compliance laws, etc.) that are relevant to their use case.
+## 🎯 Implementation Features
 
-***Nothing contained in this Model Card should be interpreted as or deemed a restriction or modification to the license the model is released under.*** 
+### Split Inference Architecture
 
-## Usage
+✅ **Hybrid CPU/iGPU Execution**: Intelligent operation partitioning based on compute characteristics  
+✅ **Bandwidth-Aware Scheduling**: Token semaphore prevents memory bus contention  
+✅ **Custom SYCL Kernels**: MoE routing, scatter/gather, batched expert dispatch  
+✅ **Vendor Library Integration**: oneDNN (CPU), oneMKL (iGPU), ONNX Runtime  
+✅ **Pipelining**: Double-buffered expert weights with compute/transfer overlap  
+✅ **Graceful Fallback**: CPU-only inference path for reliability  
+
+### Target Hardware
+
+**Intel Core Ultra 9 185H**:
+- 16 cores, 22 threads
+- Intel Arc Graphics (integrated)
+- Shared LPDDR5 memory (~50 GB/s)
+- Full oneAPI support (SYCL/DPC++, Level-Zero, oneDNN)
+
+---
+
+## 📂 Repository Structure
+
+```
+slm-aplit/
+├── split_inference/              # Split CPU/iGPU inference system
+│   ├── configs/
+│   │   └── partition_config.yaml  # Device partitioning configuration
+│   ├── cpp/
+│   │   ├── scheduler.cpp          # C++ scheduler (ZeroMQ server)
+│   │   └── CMakeLists.txt         # Build system
+│   ├── python/
+│   │   └── orchestrator.py        # Python orchestrator (client)
+│   ├── sycl_kernels/
+│   │   └── moe_routing.hpp        # Custom SYCL kernels for MoE
+│   └── tests/
+│       └── test_system.py         # Integration tests
+├── export_to_onnx.py             # Model analysis & ONNX export tool
+├── setup_split_inference.sh      # Automated setup (oneAPI + deps)
+├── cpu_inference.py              # CPU-only inference (baseline)
+├── QUICKSTART.md                 # Get started in < 30 minutes
+├── SPLIT_INFERENCE_README.md     # Complete technical documentation
+├── IMPLEMENTATION_STATUS.md      # Current status & roadmap
+└── DELIVERABLES.md               # Full deliverables summary
+```
+
+---
+
+## ⚡ Quick Start
+
+### 1. Automated Setup (Recommended)
+
+```bash
+# Clone/navigate to repository
+cd "/path/to/slm-aplit"
+
+# Run automated setup (installs oneAPI, builds scheduler)
+chmod +x setup_split_inference.sh
+./setup_split_inference.sh
+```
+
+This installs:
+- Intel oneAPI Base Toolkit (~10GB)
+- System dependencies (CMake, ZeroMQ)
+- Python environment with PyTorch CPU
+- Builds C++ scheduler
+
+**Time**: 15-30 minutes (depending on download speed)
+
+### 2. Run Tests
+
+```bash
+source venv/bin/activate
+python3 split_inference/tests/test_system.py
+```
+
+**Expected**: ✅ Config loading, ✅ CPU fallback tests pass
+
+### 3. Start Split Inference
+
+**Terminal 1** (Scheduler):
+```bash
+source enable_oneapi.sh
+./run_scheduler.sh
+```
+
+**Terminal 2** (Orchestrator):
+```bash
+source venv/bin/activate
+./run_orchestrator.sh
+```
+
+**OR** use CPU-only fallback:
+```bash
+python3 cpu_inference.py --prompt "What is quantum computing?" --max-tokens 100
+```
+
+📖 **See [QUICKSTART.md](QUICKSTART.md) for detailed step-by-step instructions**
+
+---
+
+## 📚 Documentation
+
+| Document | Purpose | Audience |
+|----------|---------|----------|
+| **[QUICKSTART.md](QUICKSTART.md)** | Get running in < 30 min | All users |
+| **[SPLIT_INFERENCE_README.md](SPLIT_INFERENCE_README.md)** | Complete technical guide | Developers |
+| **[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)** | Current status & roadmap | Contributors |
+| **[DELIVERABLES.md](DELIVERABLES.md)** | Full deliverables summary | Project reviewers |
+
+---
+
+## 🛠️ Original Model Usage (CPU-only)
 
 ### Input Formats
 Given the nature of the training data, the Phi-tiny-MoE model is best suited for prompts using the chat format as follows:
@@ -42,8 +147,9 @@ How to explain Internet for a medieval knight?<|end|>
 <|assistant|>
 ```
 
-### Loading the model locally
-After obtaining the Phi-tiny-MoE model checkpoints, users can use this sample code for inference.
+### Loading the model locally (CPU-only baseline)
+
+After obtaining the Phi-tiny-MoE model checkpoints, use this sample code for CPU inference:
 
 ```python
 import torch
