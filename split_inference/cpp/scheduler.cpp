@@ -21,6 +21,9 @@
 #include <sycl/sycl.hpp>
 #endif
 
+// Bandwidth-aware scheduling
+#include "bandwidth_monitor.hpp"
+
 using json = nlohmann::json;
 using Clock = std::chrono::high_resolution_clock;
 using TimePoint = std::chrono::time_point<Clock>;
@@ -206,7 +209,7 @@ private:
  */
 class DeviceExecutor {
 public:
-    DeviceExecutor() {
+    DeviceExecutor(bool enable_bandwidth_aware = true) {
         std::cout << "🔧 Initializing device executor..." << std::endl;
         
 #ifdef ENABLE_SYCL
@@ -241,6 +244,22 @@ public:
 #endif
         
         std::cout << "  ✓ CPU executor ready" << std::endl;
+        
+        // Initialize bandwidth monitor
+        if (enable_bandwidth_aware) {
+            bandwidth_monitor_ = std::make_unique<BandwidthMonitor>();
+            bandwidth_monitor_->start();
+            bandwidth_aware_ = true;
+            std::cout << "  ✓ Bandwidth-aware scheduling enabled" << std::endl;
+        } else {
+            std::cout << "  • Static scheduling mode" << std::endl;
+        }
+    }
+    
+    ~DeviceExecutor() {
+        if (bandwidth_monitor_) {
+            bandwidth_monitor_->stop();
+        }
     }
     
     WorkResult execute(const WorkPacket& packet) {
@@ -251,10 +270,18 @@ public:
         auto start = Clock::now();
         
         try {
-            // Determine device
-            std::string device = packet.device_target;
-            if (device == "auto") {
-                device = choose_device(packet);
+            // Determine device (with bandwidth-aware override)
+            std::string device = determine_device(packet);
+            
+            // Check if this is a heavy operation requiring DRAM token
+            bool is_heavy = bandwidth_aware_ && 
+                           bandwidth_monitor_ && 
+                           bandwidth_monitor_->is_heavy_operation(packet.operation);
+            
+            // Acquire DRAM token for heavy operations (prevents concurrent heavy ops)
+            if (is_heavy) {
+                bandwidth_monitor_->acquire_dram_token_blocking(packet.operation);
+                std::cout << "  🔒 DRAM token acquired for " << packet.operation << std::endl;
             }
             
             // Execute on chosen device
@@ -271,6 +298,12 @@ public:
                 result.error_message = "Unknown device: " + device;
             }
             
+            // Release DRAM token
+            if (is_heavy && bandwidth_monitor_) {
+                bandwidth_monitor_->release_dram_token(packet.operation);
+                std::cout << "  🔓 DRAM token released" << std::endl;
+            }
+            
             auto end = Clock::now();
             result.actual_duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
             
@@ -284,8 +317,47 @@ public:
     
     bool is_igpu_available() const { return igpu_available_; }
     
+    BandwidthMonitor::BandwidthStats get_bandwidth_stats() const {
+        if (bandwidth_monitor_) {
+            return bandwidth_monitor_->get_stats();
+        }
+        return BandwidthMonitor::BandwidthStats{};
+    }
+    
 private:
-    std::string choose_device(const WorkPacket& packet) {
+    std::string determine_device(const WorkPacket& packet) {
+        // Start with requested device
+        std::string device = packet.device_target;
+        
+        // Handle "auto" selection
+        if (device == "auto") {
+            device = choose_device_heuristic(packet);
+        }
+        
+        // Apply bandwidth-aware override if enabled
+        if (bandwidth_aware_ && bandwidth_monitor_) {
+            auto throttle_action = bandwidth_monitor_->get_throttle_action();
+            
+            // If we're overloaded and planning to use iGPU, consider CPU fallback
+            if (throttle_action == BandwidthMonitor::ThrottleAction::FALLBACK_CPU && device == "igpu") {
+                std::cout << "  ⚠️  Bandwidth overload detected, falling back to CPU" << std::endl;
+                device = "cpu";
+            }
+            
+            // For DELAY_LAUNCH, add a small delay
+            if (throttle_action == BandwidthMonitor::ThrottleAction::DELAY_LAUNCH) {
+                std::cout << "  ⏸️  Delaying launch due to bandwidth pressure..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            
+            // Note: REDUCE_BATCH would require modifying packet batch size,
+            // which is more complex - skipping for now
+        }
+        
+        return device;
+    }
+    
+    std::string choose_device_heuristic(const WorkPacket& packet) {
         // Simple heuristic: heavy compute → iGPU, light → CPU
         if (packet.operation.find("ffn") != std::string::npos ||
             packet.operation.find("expert") != std::string::npos) {
@@ -340,6 +412,8 @@ private:
     }
     
     bool igpu_available_ = false;
+    bool bandwidth_aware_ = false;
+    std::unique_ptr<BandwidthMonitor> bandwidth_monitor_;
     
 #ifdef ENABLE_SYCL
     std::unique_ptr<sycl::device> igpu_device_;
@@ -395,6 +469,8 @@ public:
                     response = handle_work_packet(request_json["data"]);
                 } else if (request_type == "get_telemetry") {
                     response = handle_get_telemetry();
+                } else if (request_type == "get_bandwidth_stats") {
+                    response = handle_get_bandwidth_stats();
                 } else if (request_type == "shutdown") {
                     response = handle_shutdown();
                 } else {
@@ -465,6 +541,20 @@ private:
         json response;
         response["status"] = "success";
         response["telemetry"] = telemetry_->to_json();
+        return response;
+    }
+    
+    json handle_get_bandwidth_stats() {
+        json response;
+        response["status"] = "success";
+        
+        auto stats = executor_->get_bandwidth_stats();
+        json stats_json;
+        stats_json["cpu_bandwidth_gbps"] = stats.cpu_bandwidth_gbps;
+        stats_json["igpu_bandwidth_gbps"] = stats.igpu_bandwidth_gbps;
+        stats_json["utilization"] = stats.utilization;
+        
+        response["bandwidth_stats"] = stats_json;
         return response;
     }
     

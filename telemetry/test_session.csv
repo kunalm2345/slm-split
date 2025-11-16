@@ -1,0 +1,6 @@
+timestamp,device,worker_instance,duration_ms,packet_id,layer_idx,operation,success,memory_used_mb,error_message
+1763318011.4944792,cpu,cpu_embedding,0.500,1,-1,embedding,True,10.50,
+1763318011.494519,igpu,igpu_attention_layer_0,2.300,2,0,attention_qkv_proj,True,45.20,
+1763318011.4945402,cpu,cpu_router,0.800,3,0,router_logits,True,5.10,
+1763318011.4945562,igpu,igpu_expert_ffn_layer_0,5.200,4,0,expert_ffn,True,128.50,
+1763318011.4945707,cpu,cpu_attention_layer_1,3.100,5,1,attention_qkv_proj,False,0.00,iGPU out of memory

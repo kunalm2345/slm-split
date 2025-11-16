@@ -14,7 +14,14 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 import time
 import logging
+import sys
 from transformers import AutoTokenizer, AutoConfig
+
+# Add current directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Import telemetry logger
+from telemetry_logger import TelemetryLogger
 
 # Configure logging
 logging.basicConfig(
@@ -226,12 +233,16 @@ class SplitInferenceOrchestrator:
                  model_path: str,
                  config_path: str = "split_inference/configs/partition_config.yaml",
                  scheduler_address: str = "tcp://localhost:5555",
-                 use_cpu_fallback: bool = True):
+                 use_cpu_fallback: bool = True,
+                 telemetry_dir: str = "./telemetry"):
         
         self.model_path = Path(model_path)
         self.config = PartitionConfig(config_path)
         self.scheduler = SchedulerClient(scheduler_address)
         self.use_cpu_fallback = use_cpu_fallback
+        
+        # Initialize telemetry logger
+        self.telemetry = TelemetryLogger(output_dir=telemetry_dir)
         
         # Load tokenizer and model config
         logger.info("Loading tokenizer and config...")
@@ -269,6 +280,45 @@ class SplitInferenceOrchestrator:
             )
             logger.info("✓ CPU fallback model loaded")
     
+    def _send_and_log_packet(self, packet: WorkPacket) -> WorkResult:
+        """
+        Send work packet to scheduler and log telemetry
+        Returns result or raises RuntimeError on failure
+        """
+        result = self.scheduler.send_work_packet(packet)
+        
+        if result:
+            # Log telemetry
+            self.telemetry.log_work_result(
+                packet_id=packet.packet_id,
+                layer_idx=packet.layer_idx,
+                operation=packet.operation,
+                device_target=packet.device_target,
+                result_device=result.device_used or packet.device_target,
+                duration_ms=result.actual_duration_ms,
+                success=result.success,
+                memory_used_mb=result.memory_used_mb,
+                error_message=result.error_message
+            )
+            
+            if not result.success:
+                raise RuntimeError(f"{packet.operation} failed at layer {packet.layer_idx}: {result.error_message}")
+        else:
+            # No response from scheduler
+            self.telemetry.log_work_result(
+                packet_id=packet.packet_id,
+                layer_idx=packet.layer_idx,
+                operation=packet.operation,
+                device_target=packet.device_target,
+                result_device="unknown",
+                duration_ms=0.0,
+                success=False,
+                error_message="No response from scheduler"
+            )
+            raise RuntimeError(f"{packet.operation} failed: No response from scheduler")
+        
+        return result
+    
     def generate(self,
                  prompt: str,
                  max_new_tokens: int = 100,
@@ -287,7 +337,8 @@ class SplitInferenceOrchestrator:
         inputs = self.tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"]
         
-        logger.info(f"Input tokens: {input_ids.shape[1]}")
+        prompt_tokens = input_ids.shape[1]
+        logger.info(f"Input tokens: {prompt_tokens}")
         
         # Try split inference first
         try:
@@ -313,11 +364,18 @@ class SplitInferenceOrchestrator:
         
         end_time = time.time()
         
+        # Finalize telemetry
+        tokens_generated = len(generated_ids[0]) - len(input_ids[0])
+        self.telemetry.finalize(
+            tokens_generated=tokens_generated,
+            prompt_tokens=prompt_tokens
+        )
+        
         # Collect telemetry
-        telemetry = self.scheduler.get_telemetry() or {}
+        telemetry = self.telemetry.get_summary_stats()
         telemetry['total_time_s'] = end_time - start_time
-        telemetry['tokens_generated'] = len(generated_ids[0]) - len(input_ids[0])
-        telemetry['tokens_per_second'] = telemetry['tokens_generated'] / telemetry['total_time_s']
+        telemetry['tokens_generated'] = tokens_generated
+        telemetry['tokens_per_second'] = tokens_generated / (end_time - start_time)
         
         return generated_text, telemetry
     
@@ -381,9 +439,7 @@ class SplitInferenceOrchestrator:
                 estimated_duration_ms=0.1
             )
             
-            result = self.scheduler.send_work_packet(embedding_packet)
-            if not result or not result.success:
-                raise RuntimeError(f"Embedding failed: {result.error_message if result else 'No response'}")
+            result = self._send_and_log_packet(embedding_packet)
             
             # Hidden states shape: [batch_size, seq_len, hidden_size]
             hidden_states_shape = [batch_size, current_seq_len, hidden_size]
@@ -408,9 +464,7 @@ class SplitInferenceOrchestrator:
                     estimated_duration_ms=0.5
                 )
                 
-                result = self.scheduler.send_work_packet(layernorm_packet)
-                if not result or not result.success:
-                    raise RuntimeError(f"LayerNorm failed at layer {layer_idx}")
+                result = self._send_and_log_packet(layernorm_packet)
                 
                 # 2b. Attention QKV projection (iGPU if configured)
                 packet_id += 1
@@ -432,9 +486,7 @@ class SplitInferenceOrchestrator:
                     estimated_duration_ms=2.0
                 )
                 
-                result = self.scheduler.send_work_packet(attention_packet)
-                if not result or not result.success:
-                    raise RuntimeError(f"Attention failed at layer {layer_idx}")
+                result = self._send_and_log_packet(attention_packet)
                 
                 # 2c. MoE Router logits (CPU)
                 packet_id += 1
@@ -454,9 +506,7 @@ class SplitInferenceOrchestrator:
                     estimated_duration_ms=0.5
                 )
                 
-                result = self.scheduler.send_work_packet(router_packet)
-                if not result or not result.success:
-                    raise RuntimeError(f"Router failed at layer {layer_idx}")
+                result = self._send_and_log_packet(router_packet)
                 
                 # 2d. Expert selection (CPU - fast top-k)
                 packet_id += 1
@@ -476,9 +526,7 @@ class SplitInferenceOrchestrator:
                     estimated_duration_ms=0.2
                 )
                 
-                result = self.scheduler.send_work_packet(expert_select_packet)
-                if not result or not result.success:
-                    raise RuntimeError(f"Expert selection failed at layer {layer_idx}")
+                result = self._send_and_log_packet(expert_select_packet)
                 
                 # 2e. Expert FFN computation (iGPU - heavy GEMM)
                 packet_id += 1
@@ -503,9 +551,7 @@ class SplitInferenceOrchestrator:
                     estimated_duration_ms=5.0
                 )
                 
-                result = self.scheduler.send_work_packet(expert_ffn_packet)
-                if not result or not result.success:
-                    raise RuntimeError(f"Expert FFN failed at layer {layer_idx}")
+                result = self._send_and_log_packet(expert_ffn_packet)
                 
                 logger.debug(f"    ✓ Layer {layer_idx} complete")
             
@@ -525,9 +571,7 @@ class SplitInferenceOrchestrator:
                 estimated_duration_ms=0.5
             )
             
-            result = self.scheduler.send_work_packet(final_norm_packet)
-            if not result or not result.success:
-                raise RuntimeError("Final LayerNorm failed")
+            result = self._send_and_log_packet(final_norm_packet)
             
             # Step 4: LM head projection (CPU)
             packet_id += 1
@@ -547,9 +591,7 @@ class SplitInferenceOrchestrator:
                 estimated_duration_ms=1.0
             )
             
-            result = self.scheduler.send_work_packet(lm_head_packet)
-            if not result or not result.success:
-                raise RuntimeError("LM head projection failed")
+            result = self._send_and_log_packet(lm_head_packet)
             
             # Step 5: Sample next token (local CPU operation)
             # In real implementation, we'd get logits from result and sample

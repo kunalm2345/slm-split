@@ -1,0 +1,43 @@
+======================================================================
+TELEMETRY ANALYSIS SUMMARY
+======================================================================
+
+Session: session_2025-11-17_00-05-10
+Total Time: 33.869 seconds
+Tokens Generated: 50
+Throughput: 1.48 tokens/s
+
+----------------------------------------------------------------------
+DEVICE UTILIZATION
+----------------------------------------------------------------------
+Total Packets: 8150
+CPU Packets: 1750 (21.5%)
+iGPU Packets: 6400 (78.5%)
+Failed Packets: 0
+Success Rate: 100.0%
+
+----------------------------------------------------------------------
+EXECUTION TIME
+----------------------------------------------------------------------
+Total CPU Time: 1847.00 ms
+Total iGPU Time: 26.26 ms
+Average CPU Time: 1.055 ms/op
+Average iGPU Time: 0.004 ms/op
+
+----------------------------------------------------------------------
+TOP 5 SLOWEST OPERATIONS
+----------------------------------------------------------------------
+  embedding                 Layer  -1  cpu       1.683 ms
+  expert_selection          Layer   1  cpu       1.462 ms
+  expert_selection          Layer   1  cpu       1.235 ms
+  expert_selection          Layer  11  cpu       1.139 ms
+  expert_selection          Layer  18  cpu       1.133 ms
+
+----------------------------------------------------------------------
+TOP 5 MOST FREQUENT OPERATIONS
+----------------------------------------------------------------------
+  attention_layernorm             1600 times
+  attention_qkv_proj              1600 times
+  router_logits                   1600 times
+  expert_selection                1600 times
+  expert_ffn                      1600 times
